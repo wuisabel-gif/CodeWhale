@@ -828,6 +828,7 @@ dependencies = [
  "codewhale-secrets",
  "codewhale-state",
  "dirs",
+ "libc",
  "reqwest",
  "rustls",
  "semver",
@@ -837,6 +838,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "windows",
 ]
 
 [[package]]

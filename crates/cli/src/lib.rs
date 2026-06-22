@@ -1768,15 +1768,22 @@ fn delegate_to_tui(
 /// child before the dispatcher exits, and `kill_on_drop` tears the child down
 /// if the dispatcher unwinds.
 ///
-/// An uncatchable `SIGKILL` of the dispatcher cannot run this path; covering
-/// that needs `PR_SET_PDEATHSIG` (Linux) / Job Objects (Windows) and is tracked
-/// as follow-up on #3259.
+/// For an *uncatchable* dispatcher death (SIGKILL, a hard crash) the Tokio
+/// supervisor above can't run, so two OS-level safety nets are installed as
+/// well (#3259): on Linux the child sets `PR_SET_PDEATHSIG` so the kernel
+/// signals it when the dispatcher dies; on Windows the child is placed in a
+/// kill-on-job-close Job Object so closing the dispatcher's handle (which the
+/// OS does on process death) terminates it. macOS has no equivalent primitive,
+/// so an uncatchable dispatcher death there can still orphan the child.
 fn delegate_server_to_tui(
     cli: &Cli,
     resolved_runtime: &ResolvedRuntimeOptions,
     passthrough: Vec<String>,
 ) -> Result<()> {
-    let std_cmd = build_tui_command(cli, resolved_runtime, passthrough)?;
+    let mut std_cmd = build_tui_command(cli, resolved_runtime, passthrough)?;
+    // Linux: signal the child if the dispatcher dies for any reason (no-op
+    // elsewhere). Set before the child is spawned.
+    install_parent_death_signal(&mut std_cmd);
     let tui = PathBuf::from(std_cmd.get_program());
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -1788,6 +1795,12 @@ fn delegate_server_to_tui(
         let mut child = cmd
             .spawn()
             .map_err(|err| anyhow!("{}", tui_spawn_error(&tui, &err)))?;
+        // Windows: hold a kill-on-job-close Job Object for the dispatcher's
+        // lifetime so an uncatchable dispatcher death tears the child down.
+        // Bound for the whole `block_on` scope; never dropped early because the
+        // match arms below `std::process::exit`.
+        #[cfg(windows)]
+        let _child_job = attach_server_child_job(&child);
         match supervise_server_child(&mut child, server_shutdown_signal()).await? {
             ServerTeardown::Exited(status) => exit_with_tui_status(status),
             // The child has been killed and reaped; exit with the conventional
@@ -1866,6 +1879,111 @@ async fn server_shutdown_signal() -> i32 {
 async fn server_shutdown_signal() -> i32 {
     let _ = tokio::signal::ctrl_c().await;
     130
+}
+
+/// Install a parent-death signal on `cmd` so the spawned child is signalled
+/// with `SIGTERM` if the dispatcher process dies for any reason — including an
+/// uncatchable `SIGKILL` or crash the Tokio supervisor cannot observe (#3259).
+/// Mirrors `install_parent_death_signal` in `crates/tui/src/tools/shell.rs`.
+#[cfg(target_os = "linux")]
+fn install_parent_death_signal(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: `pre_exec` runs in the child between fork and exec. The closure
+    // only calls `libc::prctl` with stack-allocated constant arguments — it does
+    // not allocate or touch the parent's locks, meeting the async-signal-safe +
+    // no-allocation requirements of the post-fork window.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM, 0, 0, 0) == -1 {
+                // Non-fatal: the child only loses the parent-death safety net.
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+}
+
+/// No parent-death-signal primitive outside Linux; the Windows path uses a Job
+/// Object instead (see `attach_server_child_job`) and macOS has no equivalent.
+#[cfg(not(target_os = "linux"))]
+fn install_parent_death_signal(_cmd: &mut Command) {}
+
+/// Assign the delegated server `child` to a kill-on-job-close Job Object so the
+/// OS terminates it when the dispatcher's handle to the job closes — which it
+/// does on any dispatcher exit, including an uncatchable kill (#3259). The
+/// returned guard must be held for the dispatcher's lifetime. Best-effort:
+/// returns `None` if the job cannot be created or assigned. Mirrors the Job
+/// Object idiom in `crates/tui/src/tools/shell.rs`.
+#[cfg(windows)]
+fn attach_server_child_job(child: &tokio::process::Child) -> Option<ServerChildJob> {
+    let raw = child.raw_handle()?;
+    match ServerChildJob::attach(raw) {
+        Ok(job) => Some(job),
+        Err(err) => {
+            tracing::warn!("failed to place delegated server child in a job object: {err}");
+            None
+        }
+    }
+}
+
+#[cfg(windows)]
+struct ServerChildJob {
+    handle: windows::Win32::Foundation::HANDLE,
+}
+
+// SAFETY: the wrapped value is a process-wide kernel handle; moving it across
+// threads does not invalidate it, and it is only ever closed once, on drop.
+#[cfg(windows)]
+unsafe impl Send for ServerChildJob {}
+
+#[cfg(windows)]
+impl ServerChildJob {
+    fn attach(child_handle: std::os::windows::io::RawHandle) -> std::io::Result<Self> {
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+            SetInformationJobObject,
+        };
+        use windows::core::PCWSTR;
+
+        // SAFETY: FFI calls with valid arguments; results are checked via the
+        // `windows` Result wrappers and the handle is stored for close-on-drop.
+        let handle = unsafe { CreateJobObjectW(None, PCWSTR::null()) }.map_err(win_io_error)?;
+        let job = Self { handle };
+
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        unsafe {
+            SetInformationJobObject(
+                job.handle,
+                JobObjectExtendedLimitInformation,
+                &limits as *const _ as *const core::ffi::c_void,
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+            .map_err(win_io_error)?;
+            AssignProcessToJobObject(job.handle, HANDLE(child_handle)).map_err(win_io_error)?;
+        }
+        Ok(job)
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ServerChildJob {
+    fn drop(&mut self) {
+        // Closing the last handle triggers KILL_ON_JOB_CLOSE. On a normal return
+        // the child has already been reaped, so this is a no-op cleanup; an
+        // uncatchable dispatcher death closes the handle via the OS instead.
+        unsafe {
+            let _ = windows::Win32::Foundation::CloseHandle(self.handle);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn win_io_error(err: windows::core::Error) -> std::io::Error {
+    std::io::Error::other(err)
 }
 
 #[cfg(all(test, unix))]
