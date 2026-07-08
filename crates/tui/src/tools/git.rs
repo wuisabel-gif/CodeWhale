@@ -278,14 +278,7 @@ fn run_git_command(working_dir: &Path, args: &[String]) -> Result<std::process::
 }
 
 fn format_command(working_dir: &Path, args: &[String]) -> String {
-    format!(
-        "git -C {} {}",
-        working_dir.display(),
-        args.iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>()
-            .join(" ")
-    )
+    format!("git -C {} {}", working_dir.display(), args.join(" "))
 }
 
 fn truncate_with_note(text: &str, max_chars: usize) -> (String, bool, usize) {
