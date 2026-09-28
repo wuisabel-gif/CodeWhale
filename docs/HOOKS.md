@@ -272,7 +272,42 @@ rebrand.
 | `DEEPSEEK_TOOL_RESULT` | `tool_call_after`, `on_error` (tool failures) | truncated at 10 000 bytes |
 | `DEEPSEEK_TOOL_SUCCESS` | `tool_call_after`, `on_error` (tool failures) | `true` / `false` |
 | `DEEPSEEK_TOOL_EXIT_CODE` | `tool_call_after` and `on_error` **when the tool reported one** | absent otherwise — never synthesized; 64-bit, so Windows crash codes such as `3221225477` survive |
+| `DEEPSEEK_TOOL_EXECUTION_RECEIPT` | `tool_call_after`, supported local foreground shell results only | optional complete JSON, at most 32 KiB; see below |
 | `DEEPSEEK_SESSION_COST` | when cost is supplied | USD, six decimal places |
+
+**Local execution receipt (schema version 1).** The existing observer worker
+exports runtime-derived `execution_receipt` metadata, not the before-hook input:
+
+```json
+{"schema_version":1,"command":"printf hello","cwd":"/absolute/workspace","state":"completed","scope":"local","exit_code":0,"stdout":"hello","stderr":"","stdout_truncated":false,"stderr_truncated":false,"output_kind":"separate"}
+```
+
+`command` is the effective admitted shell source supplied to the dispatcher,
+not the original pre-rewrite request or the shell executable/argv wrapper.
+`cwd` is the resolved absolute initial process directory. Identities are never
+truncated: invalid identities or either identity over 8 KiB omit the receipt.
+Only settled pipe-backed local foreground execution is supported initially;
+background launches, foreground-to-background transfers, PTY/interactive,
+external/OS sandboxed execution, read-only argv hardening, Windows, and
+denials before execution omit it. Absence does not imply success or failure.
+
+`state` is `completed` for an observed normal exit (including nonzero exits),
+or `interrupted` for a signal/kill/timeout. `exit_code` is the observed integer
+or JSON `null`, never synthesized from success or interruption. The lowercase
+`bash` contract uses a shared output pipe: `output_kind:"combined"` means
+`stdout` holds the host's **combined stdout/stderr preview**, and `stderr` is
+empty. Consumers must label that preview as combined, not separate stdout.
+Legacy `exec_shell` pipe execution uses `output_kind:"separate"`.
+The initial lowercase `bash` coverage is **successful completions only**:
+its existing failed/interrupted path returns a message-only `ToolError` and
+cannot carry this receipt. That error variant/control flow is unchanged.
+Legacy `exec_shell` reports both successful and failed/interrupted receipts.
+
+Output previews retain upstream truncation flags and may be further bounded
+with a `[receipt preview truncated]` marker. The bound includes JSON escaping;
+previews shrink, or the whole receipt is omitted, rather than exporting broken
+JSON. Session and tool-call identifiers remain in the existing environment
+variables. Existing result, success, and exit-code fields are unchanged.
 
 **Mode-spelling note.** UI-fired events (`session_start`, `session_end`,
 `message_submit`, `tool_call_after`, `mode_change`, `on_error`, `turn_end`,

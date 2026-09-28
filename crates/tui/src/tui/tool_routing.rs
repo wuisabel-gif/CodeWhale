@@ -651,11 +651,17 @@ fn fire_tool_completion_hooks(
     let exit_code = reported_tool_exit_code(result);
 
     if wants_after {
-        let context = app
+        let mut context = app
             .base_hook_context()
             .with_tool_name(name)
             .with_tool_call_id(id)
             .with_tool_result(&result_text, success, exit_code);
+        context.tool_execution_receipt = result
+            .as_ref()
+            .ok()
+            .and_then(|result| result.metadata.as_ref())
+            .and_then(|metadata| metadata.get("execution_receipt"))
+            .cloned();
         if let Err(error) = app.submit_hooks(HookEvent::ToolCallAfter, context) {
             app.surface_observer_hook_submission_failure(error);
         }
@@ -2187,12 +2193,52 @@ mod tests {
             .collect()
     }
 
-    /// A UI-ignored completion is still a completion. `tool_call_after` and
-    /// `on_error` must fire for it — exactly once — or the documented "fires
-    /// after each tool call" silently excludes repeated `wait` and background
-    /// results, which is the class of call an observer most wants to record.
     #[cfg(unix)]
     #[test]
+    fn execution_receipt_reaches_after_observer_without_changing_legacy_output() {
+        use crate::hooks::{Hook, HookEvent, HookExecutor, HooksConfig};
+
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("receipt.log");
+        let mut app = crate::test_support::test_app_with_options(
+            crate::test_support::test_tui_options(dir.path()),
+        );
+        app.workspace = dir.path().to_path_buf();
+        app.hooks = HookExecutor::new(
+            HooksConfig {
+                enabled: true,
+                hooks: vec![Hook::new(
+                    HookEvent::ToolCallAfter,
+                    &format!(
+                        "printf '%s\\n' \"$DEEPSEEK_TOOL_EXECUTION_RECEIPT\" \"$DEEPSEEK_TOOL_RESULT\" \"$DEEPSEEK_TOOL_CALL_ID\" >> '{}'",
+                        log.display()
+                    ),
+                )],
+                ..HooksConfig::default()
+            },
+            dir.path().to_path_buf(),
+        );
+        let receipt = json!({"schema_version": 1, "command": "printf effective",
+            "cwd": dir.path(), "state": "completed", "scope": "local", "exit_code": 0,
+            "stdout": "effective", "stderr": "", "stdout_truncated": false,
+            "stderr_truncated": false, "output_kind": "separate"});
+        let result = ToolResult::success("legacy-output")
+            .with_metadata(json!({"execution_receipt": receipt}));
+        fire_tool_completion_hooks(&mut app, "receipt-call", "exec_shell", &Ok(result));
+        let lines = hook_log_lines_eventually(&log, 3);
+        assert_eq!(lines.len(), 3);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&lines[0]).unwrap(),
+            receipt
+        );
+        assert_eq!(lines[1], "legacy-output");
+        assert_eq!(lines[2], "receipt-call");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    /// A UI-ignored completion is still a completion. After/error observers
+    /// must fire exactly once even when presentation ignores the call.
     fn ignored_tool_calls_still_fire_after_and_error_hooks_once() {
         use crate::hooks::{Hook, HookEvent, HookExecutor, HooksConfig};
 

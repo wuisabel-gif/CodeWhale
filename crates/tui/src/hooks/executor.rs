@@ -49,6 +49,8 @@ pub struct HookContext {
     /// (`0xC0000005`) is a real value `exec_shell` reports, and narrowing it
     /// to `i32` used to discard exactly the failures a hook most wants to see.
     pub tool_exit_code: Option<i64>,
+    /// Bounded runtime-derived local execution receipt; never tool arguments.
+    pub tool_execution_receipt: Option<serde_json::Value>,
     /// Whether tool succeeded
     pub tool_success: Option<bool>,
     /// Current mode
@@ -178,6 +180,11 @@ impl HookContext {
         bound(&mut self.message, HOOK_MESSAGE_CONTEXT_MAX_BYTES);
         bound(&mut self.error_message, HOOK_ERROR_CONTEXT_MAX_BYTES);
         bound(&mut self.model, HOOK_OBSERVER_METADATA_MAX_BYTES);
+        if self.tool_execution_receipt.as_ref().is_some_and(|receipt| {
+            serde_json::to_vec(receipt).map_or(true, |encoded| encoded.len() > 32 * 1024)
+        }) {
+            self.tool_execution_receipt = None;
+        }
         if let Some(workspace) = self.workspace.take() {
             self.workspace = Some(PathBuf::from(truncate_env_value(
                 &workspace.to_string_lossy(),
@@ -217,6 +224,12 @@ impl HookContext {
         }
         if let Some(code) = self.tool_exit_code {
             env.insert("DEEPSEEK_TOOL_EXIT_CODE".to_string(), code.to_string());
+        }
+        if let Some(receipt) = self.tool_execution_receipt.as_ref()
+            && let Ok(encoded) = serde_json::to_string(receipt)
+            && encoded.len() <= 32 * 1024
+        {
+            env.insert("DEEPSEEK_TOOL_EXECUTION_RECEIPT".to_string(), encoded);
         }
         if let Some(success) = self.tool_success {
             env.insert("DEEPSEEK_TOOL_SUCCESS".to_string(), success.to_string());
@@ -4839,6 +4852,29 @@ command = "echo project"
             without_code.get("DEEPSEEK_TOOL_SUCCESS"),
             Some(&"false".to_string())
         );
+    }
+
+    #[test]
+    fn execution_receipt_env_is_optional_bounded_json_and_preserves_old_fields() {
+        let mut context = HookContext::new()
+            .with_tool_name("exec_shell")
+            .with_tool_call_id("receipt-call")
+            .with_tool_result("legacy output", false, None);
+        let old = context.to_env_vars();
+        assert!(!old.contains_key("DEEPSEEK_TOOL_EXECUTION_RECEIPT"));
+        let receipt = json!({"schema_version": 1, "command": "printf effective",
+            "cwd": "/tmp", "scope": "local", "state": "interrupted", "exit_code": null,
+            "stdout": "🐋", "stderr": "", "stdout_truncated": false, "stderr_truncated": false});
+        context.tool_execution_receipt = Some(receipt.clone());
+        let mut env = context.to_env_vars();
+        let encoded = env.remove("DEEPSEEK_TOOL_EXECUTION_RECEIPT").unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&encoded).unwrap(),
+            receipt
+        );
+        assert_eq!(env, old);
+        context.tool_execution_receipt = Some(json!({"command": "x".repeat(32768)}));
+        assert_eq!(context.to_env_vars(), old);
     }
 
     #[test]

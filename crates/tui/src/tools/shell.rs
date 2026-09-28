@@ -4125,6 +4125,7 @@ async fn execute_foreground_via_background(
     extra_env: HashMap<String, String>,
     direct_argv: bool,
     timeout_bounds_ms: (u64, u64),
+    receipt_identity: &mut Option<(String, PathBuf)>,
 ) -> Result<ShellResult> {
     let timeout_ms =
         timeout_ms.map(|timeout| timeout.clamp(timeout_bounds_ms.0, timeout_bounds_ms.1));
@@ -4137,9 +4138,27 @@ async fn execute_foreground_via_background(
         manager.clear_foreground_background_request();
         let owner = shell_job_owner_from_context(context);
         let lifecycle = shell_work_lifecycle_from_context(context);
-        manager.execute_with_options_env_for_owner_and_work(
+        // Only pipe-backed local foreground paths are supported. Read-only
+        // argv hardening and Windows prefixes have different command semantics.
+        let receipt_cwd =
+            if !cfg!(windows) && !tty && !direct_argv && context.sandbox_backend.is_none() {
+                working_dir
+                    .as_deref()
+                    .map_or_else(|| manager.default_workspace.clone(), PathBuf::from)
+                    .canonicalize()
+                    .ok()
+            } else {
+                None
+            };
+        let spawned = manager.execute_with_options_env_for_owner_and_work(
             command,
-            working_dir.as_deref(),
+            // Use the same resolved path for spawn and receipt, so a caller's
+            // symlink cannot be re-resolved to a different directory between
+            // the identity snapshot and Command::current_dir.
+            receipt_cwd
+                .as_deref()
+                .and_then(Path::to_str)
+                .or(working_dir.as_deref()),
             spawn_timeout_ms,
             true,
             stdin_data,
@@ -4154,7 +4173,14 @@ async fn execute_foreground_via_background(
             direct_argv.then_some(context.workspace.as_path()),
             false,
             timeout_bounds_ms,
-        )?
+        )?;
+        if !spawned.sandboxed
+            && !spawned.sandbox_denied
+            && let Some(cwd) = receipt_cwd
+        {
+            *receipt_identity = Some((command.to_owned(), cwd));
+        }
+        spawned
     };
     let task_id = spawned
         .task_id
@@ -4238,6 +4264,65 @@ async fn execute_foreground_via_background(
 
         tokio::time::sleep(Duration::from_millis(poll_tick_ms)).await;
         poll_tick_ms = (poll_tick_ms * 2).min(FOREGROUND_POLL_MAX_MS);
+    }
+}
+
+/// Observer-only receipt: command is the effective admitted shell source, not
+/// the shell executable/argv wrapper. Never reconstruct it from before hooks.
+fn shell_execution_receipt(
+    command: &str,
+    cwd: &Path,
+    result: &ShellResult,
+) -> Option<serde_json::Value> {
+    let cwd_text = cwd.to_str()?;
+    if command.is_empty()
+        || command.contains('\0')
+        || command.len() > 8192
+        || !cwd.is_absolute()
+        || cwd_text.contains('\0')
+        || cwd_text.len() > 8192
+        || result.sandboxed
+        || result.sandbox_denied
+    {
+        return None;
+    }
+    let state = match result.status {
+        ShellStatus::Completed => "completed",
+        ShellStatus::Failed if result.exit_code.is_some() => "completed",
+        ShellStatus::Failed | ShellStatus::Killed | ShellStatus::TimedOut => "interrupted",
+        ShellStatus::Running => return None,
+    };
+    let mut budget = 8192;
+    loop {
+        // Retain both ends (and inherited truncation flags) rather than hiding
+        // the final diagnostic. JSON escaping is accounted for below.
+        let preview = |text: &str| {
+            if text.len() <= budget {
+                return text.to_owned();
+            }
+            let head = text.floor_char_boundary(budget / 2);
+            let tail = text.ceil_char_boundary(text.len() - budget / 2);
+            format!(
+                "{}\n[receipt preview truncated]\n{}",
+                &text[..head],
+                &text[tail..]
+            )
+        };
+        let receipt = json!({
+            "schema_version": 1, "command": command, "cwd": cwd_text,
+            "output_kind": "separate",
+            "state": state, "scope": "local", "exit_code": result.exit_code,
+            "stdout": preview(&result.stdout), "stderr": preview(&result.stderr),
+            "stdout_truncated": result.stdout_truncated || result.stdout.len() > budget,
+            "stderr_truncated": result.stderr_truncated || result.stderr.len() > budget,
+        });
+        if serde_json::to_vec(&receipt).ok()?.len() <= 32 * 1024 {
+            return Some(receipt);
+        }
+        if budget == 0 {
+            return None;
+        }
+        budget /= 2;
     }
 }
 
@@ -5117,6 +5202,7 @@ impl ToolSpec for BashTool {
         }
 
         let mut lifecycle_warning = None;
+        let mut receipt_identity = None;
         let result = if interactive {
             let mut manager = context
                 .shell_manager
@@ -5200,6 +5286,7 @@ impl ToolSpec for BashTool {
                 } else {
                     (1_000, 600_000)
                 },
+                &mut receipt_identity,
             )
             .await
         };
@@ -5222,8 +5309,25 @@ impl ToolSpec for BashTool {
                     .cancel_token
                     .as_ref()
                     .is_some_and(|token| token.is_cancelled());
+                let execution_receipt = receipt_identity.as_ref().and_then(|(command, cwd)| {
+                    let mut receipt = shell_execution_receipt(command, cwd, &result)?;
+                    // The small bash contract connects both descriptors to one
+                    // pipe. Its stdout field is a combined preview, not stdout.
+                    receipt["output_kind"] = json!(if self.optional_timeout {
+                        "combined"
+                    } else {
+                        "separate"
+                    });
+                    Some(receipt)
+                });
                 if self.optional_timeout {
-                    return finish_contract_bash_result(result, timeout_ms, context);
+                    let mut result = finish_contract_bash_result(result, timeout_ms, context)?;
+                    if let Some(receipt) = execution_receipt
+                        && let Some(metadata) = result.metadata.as_mut()
+                    {
+                        metadata["execution_receipt"] = receipt;
+                    }
+                    return Ok(result);
                 }
                 let task_id_str = result.task_id.clone().unwrap_or_default();
                 let stdout_summary = summarize_output(&result.stdout);
@@ -5354,6 +5458,9 @@ impl ToolSpec for BashTool {
                         }),
                     }),
                 });
+                if let Some(receipt) = execution_receipt {
+                    metadata["execution_receipt"] = receipt;
+                }
                 metadata["backgrounded"] = json!(background || backgrounded_foreground);
                 if persist {
                     metadata["persist_requested"] = json!(true);

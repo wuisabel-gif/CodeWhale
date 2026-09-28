@@ -22,6 +22,154 @@ fn env_lock() -> &'static Mutex<()> {
 const BACKGROUND_COMPLETION_WAIT_MS: u64 = 30_000;
 
 #[test]
+fn execution_receipt_bounds_and_truthful_status() {
+    let tmp = tempdir().unwrap();
+    let cwd = tmp.path().canonicalize().unwrap();
+    let mut result = failed_network_shell_result(&"🐋\n\"\0".repeat(12000), &"err\n".repeat(12000));
+    result.sandboxed = false;
+    result.sandbox_type = None;
+    result.stdout_truncated = true;
+    result.exit_code = None;
+    result.status = ShellStatus::Killed;
+    let receipt = shell_execution_receipt("printf effective", &cwd, &result).unwrap();
+    let encoded = serde_json::to_string(&receipt).unwrap();
+    assert!(encoded.len() <= 32 * 1024);
+    assert_eq!(serde_json::from_str::<Value>(&encoded).unwrap(), receipt);
+    assert_eq!(receipt["command"], "printf effective");
+    assert_eq!(receipt["cwd"], cwd.to_str().unwrap());
+    assert_eq!(receipt["state"], "interrupted");
+    assert!(receipt["exit_code"].is_null());
+    assert_eq!(receipt["stdout_truncated"], true);
+    assert_eq!(receipt["stderr_truncated"], true);
+    result.status = ShellStatus::Failed;
+    result.exit_code = Some(3221225477);
+    let receipt = shell_execution_receipt("effective", &cwd, &result).unwrap();
+    assert_eq!(receipt["state"], "completed");
+    assert_eq!(receipt["exit_code"], 3221225477_i64);
+    result.stdout = "retained [Output truncated]".to_owned();
+    let receipt = shell_execution_receipt("effective", &cwd, &result).unwrap();
+    assert_eq!(receipt["stdout"], result.stdout);
+    assert_eq!(receipt["stdout_truncated"], true);
+    result.status = ShellStatus::Running;
+    assert!(shell_execution_receipt("effective", &cwd, &result).is_none());
+    result.status = ShellStatus::Completed;
+    assert!(shell_execution_receipt(&"x".repeat(8193), &cwd, &result).is_none());
+    assert!(shell_execution_receipt(&"\u{1}".repeat(8192), &cwd, &result).is_none());
+    assert!(shell_execution_receipt("bad\0identity", &cwd, &result).is_none());
+    assert!(shell_execution_receipt("ok", Path::new("relative"), &result).is_none());
+    assert!(
+        shell_execution_receipt("ok", Path::new(&format!("/{}", "x".repeat(8193))), &result)
+            .is_none()
+    );
+    result.sandboxed = true;
+    assert!(shell_execution_receipt("ok", &cwd, &result).is_none());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn execution_receipt_foreground_runtime_and_unsupported_paths() {
+    let tmp = tempdir().unwrap();
+    std::fs::create_dir(tmp.path().join("child")).unwrap();
+    let mut context = ToolContext::new(tmp.path());
+    context.elevated_sandbox_policy = Some(ExecutionSandboxPolicy::DangerFullAccess);
+    context.auto_approve = true;
+    let tool = BashTool::alias("exec_shell", "run");
+    // This is the post-admission input; a stale before-hook request must never
+    // become the receipt identity.
+    let original = json!({"command": "printf original", "cwd": "child"});
+    let mut effective = original.clone();
+    effective["command"] = json!("printf effective; printf diagnostic >&2; exit 7");
+    let result = tool.execute(effective.clone(), &context).await.unwrap();
+    let receipt = &result.metadata.as_ref().unwrap()["execution_receipt"];
+    assert_eq!(receipt["command"], effective["command"]);
+    assert_ne!(receipt["command"], original["command"]);
+    assert_eq!(
+        receipt["cwd"],
+        tmp.path()
+            .join("child")
+            .canonicalize()
+            .unwrap()
+            .to_str()
+            .unwrap()
+    );
+    assert_eq!(receipt["stdout"], "effective");
+    assert_eq!(receipt["stderr"], "diagnostic");
+    assert_eq!(receipt["exit_code"], 7);
+    assert_eq!(receipt["state"], "completed");
+    assert_eq!(receipt["output_kind"], "separate");
+    let interrupted = tool
+        .execute(json!({"command": "kill -TERM $$"}), &context)
+        .await
+        .unwrap();
+    let receipt = &interrupted.metadata.as_ref().unwrap()["execution_receipt"];
+    assert_eq!(receipt["state"], "interrupted");
+    assert!(receipt["exit_code"].is_null());
+    for input in [
+        json!({"command": "printf background", "background": true}),
+        json!({"command": "printf pty", "combined_output": true}),
+    ] {
+        let result = tool.execute(input, &context).await.unwrap();
+        assert!(
+            result
+                .metadata
+                .as_ref()
+                .unwrap()
+                .get("execution_receipt")
+                .is_none()
+        );
+    }
+    let result = LowercaseBashTool
+        .execute(
+            json!({"command": "printf merged; printf diagnostic >&2"}),
+            &context,
+        )
+        .await
+        .unwrap();
+    let receipt = &result.metadata.as_ref().unwrap()["execution_receipt"];
+    assert_eq!(receipt["output_kind"], "combined");
+    assert!(receipt["stdout"].as_str().unwrap().contains("merged"));
+    assert!(receipt["stdout"].as_str().unwrap().contains("diagnostic"));
+    assert_eq!(receipt["stderr"], "");
+    context.shell_policy = ShellPolicy::None;
+    let result = tool
+        .execute(json!({"command": "printf denied"}), &context)
+        .await
+        .unwrap();
+    assert!(
+        result
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("execution_receipt"))
+            .is_none()
+    );
+    struct ExternalBackend;
+    #[async_trait::async_trait]
+    impl crate::sandbox::backend::SandboxBackend for ExternalBackend {
+        fn kind(&self) -> crate::sandbox::backend::SandboxKind {
+            crate::sandbox::backend::SandboxKind::OpenSandbox
+        }
+        async fn exec(
+            &self,
+            _cmd: &str,
+            _env: &HashMap<String, String>,
+        ) -> Result<crate::sandbox::backend::SandboxOutput> {
+            Ok(crate::sandbox::backend::SandboxOutput {
+                stdout: "external output".to_owned(),
+                stderr: String::new(),
+                exit_code: 0,
+            })
+        }
+    }
+    context.shell_policy = ShellPolicy::Full;
+    context.sandbox_backend = Some(Arc::new(ExternalBackend));
+    let result = tool
+        .execute(json!({"command": "printf external"}), &context)
+        .await
+        .unwrap();
+    assert!(result.metadata.unwrap().get("execution_receipt").is_none());
+}
+
+#[test]
 fn shell_catalog_guidance_matches_execution() {
     let tool = LowercaseBashTool;
     let schema = tool.input_schema();
